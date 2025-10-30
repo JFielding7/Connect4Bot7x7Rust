@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::caches::{StateCaches, CACHE_SIZE, BEGINNING_GAME_CACHE_DEPTH, CACHE_VALUE_SHIFT};
 use crate::state::State;
 use crate::worker_threads::spawn_worker_threads;
-use std::thread::Result;
+use crate::error::{Connect4Error, Result};
 
 pub const ROWS: u32 = 7;
 pub const COLS: u32 = 7;
@@ -275,7 +275,7 @@ pub fn evaluate_position_rec(
     Some(alpha)
 }
 
-pub fn evaluate_position(game_state: State, pos: &mut usize) -> Result<i8> {
+pub fn evaluate_position_with_workers(game_state: State, pos: &mut usize) -> Result<i8> {
     let mut caches = StateCaches::new();
 
     let worker_thread_handlers = spawn_worker_threads(game_state.clone(), &caches);
@@ -290,15 +290,82 @@ pub fn evaluate_position(game_state: State, pos: &mut usize) -> Result<i8> {
         &mut caches,
         &AtomicBool::new(false),
         pos,
-    ).unwrap();
+    ).ok_or_else(|| Connect4Error::EvaluatePositionError)?;
 
     for handler in &worker_thread_handlers {
         handler.terminate();
     }
 
     for handler in worker_thread_handlers {
-        handler.join()?;
+        handler.join().map_err(|_| Connect4Error::WorkerThreadJoinError)?;
     }
 
     Ok(eval)
+}
+
+pub fn best_moves(
+    state: State,
+    caches: &mut StateCaches,
+    pos: &mut usize,
+) -> Result<Vec<u32>> {
+    let mut best_moves = Vec::new();
+    let mut threats = 0;
+
+    for (col, next_move) in next_moves(DEFAULT_MOVE_ORDER, state.height_map) {
+        let updated_pieces = update_pieces!(state.curr_pieces, next_move);
+
+        if is_win(updated_pieces) {
+            best_moves.push(col);
+        }
+
+        let updated_height_map = update_height_map!(state.height_map, next_move);
+        threats |= count_threats(updated_pieces, updated_height_map) << index!(col);
+    }
+
+    if best_moves.len() > 0 {
+        return Ok(best_moves)
+    }
+
+    let heuristic_move_order = sort_by_threats(threats);
+    let mut max_eval = MIN_EVAL;
+    let unused = AtomicBool::new(false);
+
+    for (col, next_move) in next_moves(heuristic_move_order, state.height_map) {
+        let mut eval = -evaluate_position_rec(
+            state.opp_pieces,
+            update_pieces!(state.curr_pieces, next_move),
+            update_height_map!(state.height_map, next_move),
+            state.moves_made + 1,
+            -max_eval - 1,
+            -max_eval + 1,
+            caches,
+            &unused,
+            pos
+        ).ok_or_else(|| Connect4Error::EvaluatePositionError)?;
+
+        println!("Initial Eval: {eval} {col}");
+
+        if eval > max_eval {
+            eval = -evaluate_position_rec(
+                state.opp_pieces,
+                update_pieces!(state.curr_pieces, next_move),
+                update_height_map!(state.height_map, next_move),
+                state.moves_made + 1,
+                MIN_EVAL,
+                -eval,
+                caches,
+                &unused,
+                pos
+            ).ok_or_else(|| Connect4Error::EvaluatePositionError)?;
+
+            println!("Updated Eval: {eval} {col}");
+
+            best_moves = vec![col];
+            max_eval = eval;
+        } else if eval == max_eval {
+            best_moves.push(col);
+        }
+    }
+
+    Ok(best_moves)
 }

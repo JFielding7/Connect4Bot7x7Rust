@@ -1,24 +1,25 @@
-use crate::engine::evaluate_position;
+use crate::engine::{best_moves};
 use crate::state::State;
 use std::time::Instant;
-use std::io;
+use crate::caches::StateCaches;
+use crate::error::Result;
 
 mod engine;
 mod threats;
 mod state;
 mod caches;
 mod worker_threads;
+mod error;
 
-
-fn main() -> io::Result<()> {
+fn main() -> Result<()> {
     let board = vec![
         "   X   ",
-        "   O   ",
-        "   X   ",
-        "   O   ",
-        "   X   ",
-        "   O   ",
-        "   X   ",
+        "  XO   ",
+        "  OX   ",
+        "  XO   ",
+        "  OX   ",
+        "  XO   ",
+        "  OX   ",
     ];
 
     let state = State::encode(board);
@@ -28,9 +29,11 @@ fn main() -> io::Result<()> {
     let time = Instant::now();
 
     let mut pos = 0;
-    let eval = evaluate_position(state, &mut pos);
+    let mut caches = StateCaches::new();
+    let best_moves = best_moves(state, &mut caches, &mut pos)?;
 
-    println!("Eval: {}\nPos: {}", eval.unwrap(), pos);
+    println!("Best Moves: {best_moves:?}");
+    println!("Pos: {pos}");
     println!("Time: {:?}", time.elapsed());
 
     Ok(())
