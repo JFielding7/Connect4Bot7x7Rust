@@ -1,7 +1,7 @@
 use crate::engine::{is_win, reflect_bitboard, COLS, COLUMN_MASK, DEFAULT_MOVE_ORDER, IS_LEGAL, ROWS};
 use std::collections::HashSet;
 use std::fmt;
-use crate::threat_sort::FOUR_BIT_MASK;
+use crate::threats::FOUR_BIT_MASK;
 use crate::{col_shift, index, update_height_map, update_pieces};
 
 
@@ -78,6 +78,12 @@ impl State {
             }
 
             game_state.height_map |= cell;
+        }
+
+        if (game_state.moves_made & 1) == 1 {
+            let temp = game_state.curr_pieces;
+            game_state.curr_pieces = game_state.opp_pieces;
+            game_state.opp_pieces = temp;
         }
 
         game_state

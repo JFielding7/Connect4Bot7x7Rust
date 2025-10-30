@@ -1,3 +1,4 @@
+use crate::col_shift;
 use crate::engine::{is_win, COLS, COLUMN_MASK, DEFAULT_MOVE_ORDER};
 
 pub const FOUR_BIT_MASK: u32 = 0b1111;
@@ -70,7 +71,7 @@ pub fn count_threats(pieces: u64, height_map: u64) -> u32 {
     
     for col in 0..COLS {
         
-        let col_mask = COLUMN_MASK << (col << 3);
+        let col_mask = COLUMN_MASK << col_shift!(col);
         let limit = col_mask >> 1;
         
         let mut cell = height_map & col_mask;

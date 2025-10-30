@@ -1,11 +1,14 @@
-use crate::engine::{evaluate_position, StateCaches, MAX_EVAL, MIN_EVAL};
+use crate::engine::evaluate_position;
 use crate::state::State;
-use std::{io, thread};
-use std::thread::Thread;
+use std::time::Instant;
+use std::io;
 
 mod engine;
-mod threat_sort;
+mod threats;
 mod state;
+mod caches;
+mod worker_threads;
+
 
 fn main() -> io::Result<()> {
     let board = vec![
@@ -18,55 +21,17 @@ fn main() -> io::Result<()> {
         "   X   ",
     ];
 
-    let mut game_state = State::encode(board);
-    if (game_state.moves_made & 1) == 1 {
-        let temp = game_state.curr_pieces;
-        game_state.curr_pieces = game_state.opp_pieces;
-        game_state.opp_pieces = temp;
-    }
-
-    let bitboard = game_state.to_bitboard();
-    let state = State::from_bitboard(bitboard);
+    let state = State::encode(board);
 
     println!("{}", state);
 
-    let mut caches = StateCaches::new();
+    let time = Instant::now();
+
     let mut pos = 0;
+    let eval = evaluate_position(state, &mut pos);
 
-    for next_state in state.next_states() {
-        let mut thread_caches = StateCaches::new_same_beg_cache(&caches);
-
-        thread::spawn(move || {
-            evaluate_position(
-                game_state.curr_pieces,
-                game_state.opp_pieces,
-                game_state.height_map,
-                game_state.moves_made,
-                MIN_EVAL,
-                MAX_EVAL,
-                &mut thread_caches,
-                &mut 0,
-            );
-
-            println!("Helper done!");
-        });
-
-    }
-
-    println!("Evaluating");
-
-    let eval = evaluate_position(
-        game_state.curr_pieces,
-        game_state.opp_pieces,
-        game_state.height_map,
-        game_state.moves_made,
-        MIN_EVAL,
-        MAX_EVAL,
-        &mut caches,
-        &mut pos,
-    );
-
-    println!("Eval: {}\nPos: {}", eval, pos);
+    println!("Eval: {}\nPos: {}", eval.unwrap(), pos);
+    println!("Time: {:?}", time.elapsed());
 
     Ok(())
 }

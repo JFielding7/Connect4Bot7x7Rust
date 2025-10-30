@@ -1,11 +1,17 @@
+use crate::{
+    index, cache_index,
+    get_cache_entry_eval,
+    create_cache_entry,
+    cache_get, cache_get_lower_bound, cache_get_upper_bound,
+    cache_put, cache_put_lower_bound, cache_put_upper_bound,
+};
+use crate::threats::{count_threats, sort_by_threats, FOUR_BIT_MASK};
 use std::cmp::{max, min};
-use std::collections::hash_map::Entry::{Occupied, Vacant};
-use std::collections::HashMap;
-use std::sync::Arc;
-use crate::index;
+use std::sync::atomic::{AtomicBool, Ordering};
+use crate::caches::{StateCaches, CACHE_SIZE, BEGINNING_GAME_CACHE_DEPTH, CACHE_VALUE_SHIFT};
 use crate::state::State;
-use crate::threat_sort::{count_threats, sort_by_threats, FOUR_BIT_MASK};
-use dashmap::DashMap;
+use crate::worker_threads::spawn_worker_threads;
+use std::thread::Result;
 
 pub const ROWS: u32 = 7;
 pub const COLS: u32 = 7;
@@ -21,42 +27,6 @@ pub const MIN_EVAL: i8 = -MAX_EVAL;
 const DRAW: i8 = 0;
 pub const DEFAULT_MOVE_ORDER: u32 = (3 << 0) | (2 << 4) | (4 << 8) | (5 << 12) | (1 << 16) | (6 << 20) | (0 << 24);
 pub const IS_LEGAL: u64 = 0b01111111011111110111111101111111011111110111111101111111;
-const CACHE_VALUE_SHIFT: u8 = 56;
-pub const CACHE_SIZE: usize = (1 << 19) + 1;
-const BEGINNING_GAME_CACHE_DEPTH: i8 = 32;
-
-
-pub struct StateCaches {
-    beg_game_lower_bound_cache: Arc<DashMap<u64, i8>>,
-    beg_game_upper_bound_cache: Arc<DashMap<u64, i8>>,
-    end_game_lower_bound_cache: Vec<u64>,
-    end_game_upper_bound_cache: Vec<u64>,
-}
-
-impl StateCaches {
-    pub fn from_beg_caches(
-        beg_game_lower_bound_cache: Arc<DashMap<u64, i8>>,
-        beg_game_upper_bound_cache: Arc<DashMap<u64, i8>>
-    ) -> Self {
-        Self {
-            beg_game_lower_bound_cache,
-            beg_game_upper_bound_cache,
-            end_game_lower_bound_cache: vec![0; CACHE_SIZE],
-            end_game_upper_bound_cache: vec![0; CACHE_SIZE],
-        }
-    }
-
-    pub fn new() -> Self {
-        Self::from_beg_caches(Arc::new(DashMap::new()), Arc::new(DashMap::new()))
-    }
-
-    pub fn new_same_beg_cache(&self) -> Self {
-        Self::from_beg_caches(
-            self.beg_game_lower_bound_cache.clone(),
-            self.beg_game_upper_bound_cache.clone()
-        )
-    }
-}
 
 
 macro_rules! min_eval {
@@ -85,24 +55,6 @@ macro_rules! update_height_map {
     };
 }
 
-macro_rules! cache_index {
-    ($state:expr) => {
-        $state as usize % CACHE_SIZE
-    };
-}
-
-macro_rules! get_cache_entry_eval {
-    ($cache_entry:expr) => {
-        ($cache_entry >> CACHE_VALUE_SHIFT) as i8 - MAX_PLAYER_MOVES
-    }
-}
-
-macro_rules! create_cache_entry {
-    ($state:expr, $bound:expr) => {
-        $state | ((($bound + MAX_PLAYER_MOVES) as u64) << CACHE_VALUE_SHIFT)
-    };
-}
-
 macro_rules! get_col {
     ($cols:expr, $i:expr) => {
         ($cols >> index!($i)) & FOUR_BIT_MASK
@@ -121,7 +73,6 @@ macro_rules! open_row {
         $height_map & (COLUMN_MASK << col_shift!($col))
     };
 }
-
 
 pub fn reflect_bitboard(state: u64) -> u64 {
     let mut reflected = 0;
@@ -156,115 +107,6 @@ pub fn is_win(pieces: u64) -> bool {
     false
 }
 
-fn cache_lookup(
-    state: u64,
-    moves_made: i8,
-    cache_index: usize,
-    beg_game_cache: Arc<DashMap<u64, i8>>,
-    end_game_cache: &Vec<u64>,
-    default_bound: i8
-) -> i8 {
-    if moves_made <= BEGINNING_GAME_CACHE_DEPTH {
-        if let Some(cache_bound) = beg_game_cache.get(&state) {
-            return *cache_bound
-        }
-    } else {
-        let cache_entry = end_game_cache[cache_index];
-
-        if (cache_entry & BOARD_MASK) == state {
-            return get_cache_entry_eval!(cache_entry)
-        }
-    }
-
-    default_bound
-}
-
-fn lower_bound_cache_lookup(
-    state: u64,
-    moves_made: i8,
-    cache_index: usize,
-    caches: &StateCaches,
-) -> i8 {
-    cache_lookup(
-        state,
-        moves_made,
-        cache_index,
-        caches.beg_game_lower_bound_cache.clone(),
-        &caches.end_game_lower_bound_cache,
-        MIN_EVAL,
-    )
-}
-
-fn upper_bound_cache_lookup(
-    state: u64,
-    moves_made: i8,
-    cache_index: usize,
-    caches: &StateCaches,
-) -> i8 {
-    cache_lookup(
-        state,
-        moves_made,
-        cache_index,
-        caches.beg_game_upper_bound_cache.clone(),
-        &caches.end_game_upper_bound_cache,
-        MAX_EVAL,
-    )
-}
-
-fn cache_put(
-    bound: i8,
-    state: u64,
-    moves_made: i8,
-    cache_index: usize,
-    beg_game_cache: Arc<DashMap<u64, i8>>,
-    end_game_cache: &mut Vec<u64>,
-    cmp: fn(i8, i8) -> i8
-) {
-    if moves_made > BEGINNING_GAME_CACHE_DEPTH {
-        end_game_cache[cache_index] = create_cache_entry!(state, bound);
-    } else {
-        beg_game_cache.entry(state)
-            .and_modify(|entry| *entry = cmp(*entry, bound))
-            .or_insert(bound);
-    }
-}
-
-fn cache_put_lower_bound(
-    bound: i8,
-    state: u64,
-    moves_made: i8,
-    cache_index: usize,
-    caches: &mut StateCaches,
-) {
-    cache_put(
-        bound,
-        state,
-        moves_made,
-        cache_index,
-        caches.beg_game_lower_bound_cache.clone(),
-        &mut caches.end_game_lower_bound_cache,
-        max,
-    )
-}
-
-fn cache_put_upper_bound(
-    bound: i8,
-    state: u64,
-    moves_made: i8,
-    cache_index: usize,
-    caches: &mut StateCaches,
-) {
-    cache_put(
-        bound,
-        state,
-        moves_made,
-        cache_index,
-        caches.beg_game_upper_bound_cache.clone(),
-        &mut caches.end_game_upper_bound_cache,
-        min,
-    )
-}
-
 fn next_moves(move_order: u32, height_map: u64) -> impl Iterator<Item = (u32, u64)> {
     (0..COLS).filter_map(move |i| {
         let col = get_col!(move_order, i);
@@ -279,7 +121,7 @@ fn next_moves(move_order: u32, height_map: u64) -> impl Iterator<Item = (u32, u6
 }
 
 // unpack state struct for better performance
-pub fn evaluate_position(
+pub fn evaluate_position_rec(
     curr_pieces: u64,
     opp_pieces: u64,
     height_map: u64,
@@ -287,19 +129,18 @@ pub fn evaluate_position(
     mut alpha: i8,
     mut beta: i8,
     caches: &mut StateCaches,
+    terminate: &AtomicBool,
     pos: &mut usize,
-) -> i8 {
-    if *pos == 0 {
-        println!("{curr_pieces}");
-        println!("{opp_pieces}");
-        println!("{height_map}");
-        println!("{moves_made}");
+) -> Option<i8> {
+
+    if terminate.load(Ordering::Relaxed) {
+        return None
     }
 
     *pos += 1;
 
     if moves_made == MAX_TOTAL_MOVES {
-        return DRAW;
+        return Some(DRAW);
     }
 
     alpha = max(alpha, min_eval!(moves_made));
@@ -308,14 +149,14 @@ pub fn evaluate_position(
     let state = state_bitboard(curr_pieces, height_map);
     let cache_index = cache_index!(state);
 
-    alpha = max(alpha, lower_bound_cache_lookup(state, moves_made, cache_index, caches));
+    alpha = max(alpha, cache_get_lower_bound!(state, moves_made, cache_index, caches));
     if alpha >= beta {
-        return alpha;
+        return Some(alpha);
     }
 
-    beta = min(beta, upper_bound_cache_lookup(state, moves_made, cache_index, caches));
+    beta = min(beta, cache_get_upper_bound!(state, moves_made, cache_index, caches));
     if alpha >= beta {
-        return alpha;
+        return Some(alpha);
     }
 
     let mut threats = 0;
@@ -326,7 +167,7 @@ pub fn evaluate_position(
         let updated_pieces = update_pieces!(curr_pieces, next_move);
 
         if is_win(updated_pieces) {
-            return max_eval!(moves_made);
+            return Some(max_eval!(moves_made));
         }
 
         if is_win(update_pieces!(opp_pieces, next_move)) {
@@ -338,7 +179,7 @@ pub fn evaluate_position(
 
         let next_state = state_bitboard(opp_pieces, updated_height_map);
 
-        alpha = max(alpha, -upper_bound_cache_lookup(
+        alpha = max(alpha, -cache_get_upper_bound!(
             next_state,
             moves_made + 1,
             cache_index!(next_state),
@@ -346,18 +187,18 @@ pub fn evaluate_position(
         ));
 
         if alpha >= beta {
-            return alpha;
+            return Some(alpha);
         }
 
         threats |= count_threats(updated_pieces, updated_height_map) << index!(col);
     }
 
     if forced_move_count > 1 {
-        return min_eval!(moves_made);
+        return Some(min_eval!(moves_made));
     }
 
     if forced_move_count == 1 {
-        return -evaluate_position(
+        return Some(-evaluate_position_rec(
             opp_pieces,
             update_pieces!(curr_pieces, forced_move),
             update_height_map!(height_map, forced_move),
@@ -365,8 +206,9 @@ pub fn evaluate_position(
             -beta,
             -alpha,
             caches,
+            terminate,
             pos
-        );
+        )?);
     }
 
     let heuristic_move_order = sort_by_threats(threats);
@@ -377,7 +219,7 @@ pub fn evaluate_position(
         let updated_height_map = update_height_map!(height_map, next_move);
 
         let eval = if moves_searched == 0 {
-            -evaluate_position(
+            -evaluate_position_rec(
                 opp_pieces,
                 updated_pieces,
                 updated_height_map,
@@ -385,10 +227,11 @@ pub fn evaluate_position(
                 -beta,
                 -alpha,
                 caches,
+                terminate,
                 pos
-            )
+            )?
         } else {
-            let null_window_eval = -evaluate_position(
+            let null_window_eval = -evaluate_position_rec(
                 opp_pieces,
                 updated_pieces,
                 updated_height_map,
@@ -396,11 +239,12 @@ pub fn evaluate_position(
                 -alpha - 1,
                 -alpha,
                 caches,
+                terminate,
                 pos
-            );
+            )?;
 
             if null_window_eval > alpha && null_window_eval < beta {
-                -evaluate_position(
+                -evaluate_position_rec(
                     opp_pieces,
                     updated_pieces,
                     updated_height_map,
@@ -408,8 +252,9 @@ pub fn evaluate_position(
                     -beta,
                     -alpha,
                     caches,
+                    terminate,
                     pos
-                )
+                )?
             } else {
                 null_window_eval
             }
@@ -419,75 +264,41 @@ pub fn evaluate_position(
 
         if alpha >= beta {
 
-            cache_put_lower_bound(alpha, state, moves_made, cache_index, caches);
-            return alpha;
+            cache_put_lower_bound!(alpha, state, moves_made, cache_index, caches);
+            return Some(alpha);
         }
 
         moves_searched += 1;
     }
 
-    cache_put_upper_bound(alpha, state, moves_made, cache_index, caches);
-    alpha
+    cache_put_upper_bound!(alpha, state, moves_made, cache_index, caches);
+    Some(alpha)
 }
 
-pub fn best_moves(
-    state: State,
-    caches: &mut StateCaches,
-    pos: &mut usize,
-) -> Vec<u32> {
-    let mut best_moves = Vec::new();
-    let mut threats = 0;
+pub fn evaluate_position(game_state: State, pos: &mut usize) -> Result<i8> {
+    let mut caches = StateCaches::new();
 
-    for (col, next_move) in next_moves(DEFAULT_MOVE_ORDER, state.height_map) {
-        let updated_pieces = update_pieces!(state.curr_pieces, next_move);
+    let worker_thread_handlers = spawn_worker_threads(game_state.clone(), &caches);
 
-        if is_win(updated_pieces) {
-            best_moves.push(col);
-        }
+    let eval = evaluate_position_rec(
+        game_state.curr_pieces,
+        game_state.opp_pieces,
+        game_state.height_map,
+        game_state.moves_made,
+        MIN_EVAL,
+        MAX_EVAL,
+        &mut caches,
+        &AtomicBool::new(false),
+        pos,
+    ).unwrap();
 
-        let updated_height_map = update_height_map!(state.height_map, next_move);
-        threats |= count_threats(updated_pieces, updated_height_map) << index!(col);
+    for handler in &worker_thread_handlers {
+        handler.terminate();
     }
 
-    if best_moves.len() > 0 {
-        return best_moves
+    for handler in worker_thread_handlers {
+        handler.join()?;
     }
 
-    let heuristic_move_order = sort_by_threats(threats);
-    let mut max_eval = MIN_EVAL;
-
-    for (col, next_move) in next_moves(heuristic_move_order, state.height_map) {
-        let mut eval = -evaluate_position(
-            state.opp_pieces,
-            update_pieces!(state.curr_pieces, next_move),
-            update_height_map!(state.height_map, next_move),
-            state.moves_made + 1,
-            -max_eval - 1,
-            -max_eval + 1,
-            caches,
-            pos
-        );
-
-        if eval > max_eval {
-            eval = -evaluate_position(
-                state.opp_pieces,
-                update_pieces!(state.curr_pieces, next_move),
-                update_height_map!(state.height_map, next_move),
-                state.moves_made + 1,
-                MIN_EVAL,
-                -eval,
-                caches,
-                pos
-            );
-
-            best_moves = vec![col];
-            max_eval = eval;
-        } else if eval == max_eval {
-            best_moves.push(col);
-        }
-
-        println!("Col: {col}, Eval: {eval}");
-    }
-
-    best_moves
+    Ok(eval)
 }
