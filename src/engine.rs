@@ -1,27 +1,16 @@
-use crate::{
-    index, cache_index,
-    get_cache_entry_eval,
-    create_cache_entry,
-    cache_get, cache_get_lower_bound, cache_get_upper_bound,
-    cache_put, cache_put_lower_bound, cache_put_upper_bound,
-};
-use crate::threats::{count_threats, sort_by_threats, FOUR_BIT_MASK};
+use crate::caches::{StateCaches, CACHE_SIZE};
+use crate::error::{Connect4Error, Result};
+use crate::state::*;
+use crate::threats::*;
+use crate::worker_threads::*;
+use crate::*;
 use std::cmp::{max, min};
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::caches::{StateCaches, CACHE_SIZE, BEGINNING_GAME_CACHE_DEPTH, CACHE_VALUE_SHIFT};
-use crate::state::State;
-use crate::worker_threads::spawn_worker_threads;
-use crate::error::{Connect4Error, Result};
 
-pub const ROWS: u32 = 7;
-pub const COLS: u32 = 7;
-const BOARD_BITS: usize = 56;
-const BOARD_MASK: u64 = (1 << BOARD_BITS) - 1;
-pub const COL_BITS: usize = 8;
-pub const COLUMN_MASK: u64 = (1 << COL_BITS) - 1;
+
 const CONNECTION_DIRECTIONS: &[i32; 4] = &[1, 7, 8, 9];
 const MAX_TOTAL_MOVES: i8 = 49;
-const MAX_PLAYER_MOVES: i8 = 25;
+pub const MAX_PLAYER_MOVES: i8 = 25;
 pub const MAX_EVAL: i8 = 22;
 pub const MIN_EVAL: i8 = -MAX_EVAL;
 const DRAW: i8 = 0;
@@ -41,56 +30,6 @@ macro_rules! max_eval {
     };
 }
 
-#[macro_export]
-macro_rules! update_pieces {
-    ($curr_pieces:expr, $next_move:expr) => {
-        $curr_pieces | $next_move
-    };
-}
-
-#[macro_export]
-macro_rules! update_height_map {
-    ($height_map:expr, $next_move:expr) => {
-        $height_map + $next_move
-    };
-}
-
-macro_rules! get_col {
-    ($cols:expr, $i:expr) => {
-        ($cols >> index!($i)) & FOUR_BIT_MASK
-    };
-}
-
-#[macro_export]
-macro_rules! col_shift {
-    ($col:expr) => {
-        $col << 3
-    };
-}
-
-macro_rules! open_row {
-    ($height_map:expr, $col:expr) => {
-        $height_map & (COLUMN_MASK << col_shift!($col))
-    };
-}
-
-pub fn reflect_bitboard(state: u64) -> u64 {
-    let mut reflected = 0;
-
-    for i in (0..BOARD_BITS).step_by(COL_BITS) {
-        reflected |= ((state >> i) & COLUMN_MASK) << ((BOARD_BITS - COL_BITS) - i);
-    }
-
-    reflected
-}
-
-pub fn state_bitboard(curr_pieces: u64, height_map: u64) -> u64 {
-    let bitboard = curr_pieces | height_map;
-    let reflected_bitboard = reflect_bitboard(bitboard);
-
-    min(bitboard, reflected_bitboard)
-}
-
 pub fn is_win(pieces: u64) -> bool {
     for i in CONNECTION_DIRECTIONS {
         let mut connections = pieces;
@@ -107,7 +46,7 @@ pub fn is_win(pieces: u64) -> bool {
     false
 }
 
-fn next_moves(move_order: u32, height_map: u64) -> impl Iterator<Item = (u32, u64)> {
+fn next_legal_moves(move_order: u32, height_map: u64) -> impl Iterator<Item = (u32, u64)> {
     (0..COLS).filter_map(move |i| {
         let col = get_col!(move_order, i);
         let next_move = open_row!(height_map, col);
@@ -149,12 +88,12 @@ pub fn evaluate_position_rec(
     let state = state_bitboard(curr_pieces, height_map);
     let cache_index = cache_index!(state);
 
-    alpha = max(alpha, cache_get_lower_bound!(state, moves_made, cache_index, caches));
+    alpha = max(alpha, caches.get_lower_bound(state, moves_made, cache_index));
     if alpha >= beta {
         return Some(alpha);
     }
 
-    beta = min(beta, cache_get_upper_bound!(state, moves_made, cache_index, caches));
+    beta = min(beta, caches.get_upper_bound(state, moves_made, cache_index));
     if alpha >= beta {
         return Some(alpha);
     }
@@ -163,7 +102,7 @@ pub fn evaluate_position_rec(
     let mut forced_move_count = 0;
     let mut forced_move = 0;
 
-    for (col, next_move) in next_moves(DEFAULT_MOVE_ORDER, height_map) {
+    for (col, next_move) in next_legal_moves(DEFAULT_MOVE_ORDER, height_map) {
         let updated_pieces = update_pieces!(curr_pieces, next_move);
 
         if is_win(updated_pieces) {
@@ -179,11 +118,10 @@ pub fn evaluate_position_rec(
 
         let next_state = state_bitboard(opp_pieces, updated_height_map);
 
-        alpha = max(alpha, -cache_get_upper_bound!(
+        alpha = max(alpha, -caches.get_upper_bound(
             next_state,
             moves_made + 1,
             cache_index!(next_state),
-            caches
         ));
 
         if alpha >= beta {
@@ -214,7 +152,7 @@ pub fn evaluate_position_rec(
     let heuristic_move_order = sort_by_threats(threats);
     let mut moves_searched = 0;
 
-    for (_col, next_move) in next_moves(heuristic_move_order, height_map) {
+    for (_col, next_move) in next_legal_moves(heuristic_move_order, height_map) {
         let updated_pieces = update_pieces!(curr_pieces, next_move);
         let updated_height_map = update_height_map!(height_map, next_move);
 
@@ -264,21 +202,22 @@ pub fn evaluate_position_rec(
 
         if alpha >= beta {
 
-            cache_put_lower_bound!(alpha, state, moves_made, cache_index, caches);
+            caches.put_lower_bound(alpha, state, moves_made, cache_index);
             return Some(alpha);
         }
 
         moves_searched += 1;
     }
 
-    cache_put_upper_bound!(alpha, state, moves_made, cache_index, caches);
+    caches.put_upper_bound(alpha, state, moves_made, cache_index);
     Some(alpha)
 }
 
 pub fn evaluate_position_with_workers(game_state: State, pos: &mut usize) -> Result<i8> {
     let mut caches = StateCaches::new();
 
-    let worker_thread_handlers = spawn_worker_threads(game_state.clone(), &caches);
+    let worker_thread_handlers = spawn_evaluate_position_worker_threads(
+        DEFAULT_NUM_WORKER_THREADS, &game_state, &caches);
 
     let eval = evaluate_position_rec(
         game_state.curr_pieces,
@@ -303,15 +242,16 @@ pub fn evaluate_position_with_workers(game_state: State, pos: &mut usize) -> Res
     Ok(eval)
 }
 
-pub fn best_moves(
-    state: State,
+pub fn optimal_moves(
+    state: &State,
     caches: &mut StateCaches,
     pos: &mut usize,
-) -> Result<Vec<u32>> {
+) -> Result<(i8, Vec<u32>)> {
+
     let mut best_moves = Vec::new();
     let mut threats = 0;
 
-    for (col, next_move) in next_moves(DEFAULT_MOVE_ORDER, state.height_map) {
+    for (col, next_move) in next_legal_moves(DEFAULT_MOVE_ORDER, state.height_map) {
         let updated_pieces = update_pieces!(state.curr_pieces, next_move);
 
         if is_win(updated_pieces) {
@@ -323,21 +263,21 @@ pub fn best_moves(
     }
 
     if best_moves.len() > 0 {
-        return Ok(best_moves)
+        return Ok((max_eval!(state.moves_made), best_moves))
     }
 
     let heuristic_move_order = sort_by_threats(threats);
-    let mut max_eval = MIN_EVAL;
+    let mut state_max_eval = MIN_EVAL;
     let unused = AtomicBool::new(false);
 
-    for (col, next_move) in next_moves(heuristic_move_order, state.height_map) {
+    for (col, next_move) in next_legal_moves(heuristic_move_order, state.height_map) {
         let mut eval = -evaluate_position_rec(
             state.opp_pieces,
             update_pieces!(state.curr_pieces, next_move),
             update_height_map!(state.height_map, next_move),
             state.moves_made + 1,
-            -max_eval - 1,
-            -max_eval + 1,
+            -state_max_eval - 1,
+            -state_max_eval + 1,
             caches,
             &unused,
             pos
@@ -345,7 +285,7 @@ pub fn best_moves(
 
         println!("Initial Eval: {eval} {col}");
 
-        if eval > max_eval {
+        if eval > state_max_eval {
             eval = -evaluate_position_rec(
                 state.opp_pieces,
                 update_pieces!(state.curr_pieces, next_move),
@@ -361,10 +301,32 @@ pub fn best_moves(
             println!("Updated Eval: {eval} {col}");
 
             best_moves = vec![col];
-            max_eval = eval;
-        } else if eval == max_eval {
+            state_max_eval = eval;
+        } else if eval == state_max_eval {
             best_moves.push(col);
         }
+    }
+
+    Ok((state_max_eval, best_moves))
+}
+
+pub fn optimal_moves_with_workers(
+    state: &State,
+    caches: &mut StateCaches,
+    pos: &mut usize
+) -> Result<(i8, Vec<u32>)> {
+
+    let worker_thread_handlers = spawn_evaluate_position_worker_threads(
+        DEFAULT_NUM_WORKER_THREADS, state, caches);
+
+    let best_moves = optimal_moves(state, caches, pos)?;
+
+    for handler in &worker_thread_handlers {
+        handler.terminate();
+    }
+
+    for handler in worker_thread_handlers {
+        *pos += handler.join().map_err(|_| Connect4Error::WorkerThreadJoinError)?;
     }
 
     Ok(best_moves)
