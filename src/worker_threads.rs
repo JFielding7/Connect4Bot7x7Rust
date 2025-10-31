@@ -1,5 +1,5 @@
 use crate::caches::StateCaches;
-use crate::engine::{evaluate_position_rec, optimal_moves_with_workers, MAX_EVAL, MIN_EVAL};
+use crate::engine::{evaluate_position_rec, optimal_moves, optimal_moves_with_workers, MAX_EVAL, MIN_EVAL};
 use crate::error::{Connect4Error, Result};
 use crate::state::State;
 use std::collections::VecDeque;
@@ -9,7 +9,7 @@ use std::thread;
 use std::thread::JoinHandle;
 
 
-pub const DEFAULT_NUM_WORKER_THREADS: usize = 30;
+pub const DEFAULT_NUM_WORKER_THREADS: usize = 31;
 
 pub struct WorkerThreadHandler {
     terminate_flag: Arc<AtomicBool>,
@@ -51,7 +51,7 @@ fn evaluate_position_worker_thread(
             &mut thread_caches,
             &terminate_flag_clone,
             &mut pos,
-        ).ok_or_else(|| Connect4Error::EvaluatePositionError)?;
+        );
 
         Ok(pos)
     });
@@ -68,7 +68,7 @@ pub fn spawn_evaluate_position_worker_threads(
     caches: &StateCaches
 ) -> Vec<WorkerThreadHandler> {
 
-    const WORKER_THREAD_DEPTH: usize = 2;
+    const WORKER_THREAD_DEPTH: usize = 1;
     let states = game_state.generate_states(WORKER_THREAD_DEPTH);
 
     let mut handlers = vec![];
@@ -107,7 +107,7 @@ fn database_generator_worker_thread(
 
             match state_opt {
                 Some(state) => {
-                    let (eval, _) = optimal_moves_with_workers(
+                    let (eval, _) = optimal_moves(
                         &state, &mut thread_caches, &mut pos)?;
 
                     thread_caches.put_beg_game_lower_bound(eval, state.to_bitboard());

@@ -107,6 +107,18 @@ pub fn generate_database(depth: usize, num_workers: usize) -> Result<usize> {
 
     let start = State::start_state();
 
+    // let board = vec![
+    //     "   X   ",
+    //     "   O   ",
+    //     "   X   ",
+    //     "   O   ",
+    //     "   X   ",
+    //     "   O   ",
+    //     "   X   ",
+    // ];
+    //
+    // start = State::encode(board);
+
     let mut seen = HashSet::new();
     let mut possible_states: VecDeque<State> = VecDeque::new();
 

@@ -2,6 +2,7 @@ use crate::database::generate_database;
 use crate::error::Result;
 use crate::state::State;
 use std::time::Instant;
+use crate::worker_threads::DEFAULT_NUM_WORKER_THREADS;
 
 mod engine;
 mod threats;
@@ -14,7 +15,7 @@ mod database;
 fn main() -> Result<()> {
     let time = Instant::now();
 
-    let pos = generate_database(0, 1)?;
+    let pos = generate_database(4, DEFAULT_NUM_WORKER_THREADS)?;
 
     println!("Pos: {pos}");
     println!("Time: {:?}", time.elapsed());
